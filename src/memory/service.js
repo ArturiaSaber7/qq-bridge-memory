@@ -106,6 +106,18 @@ export function createMemoryService({ store, config = {}, clock = Date.now }) {
       Number.isFinite(input.occurredAt) ? input.occurredAt : null, Number.isFinite(input.validFrom) ? input.validFrom : null,
       Number.isFinite(input.validTo) ? input.validTo : null, now, nature, String(input.reason || ''), commitmentStatus);
     for (const sourceId of sources) run('INSERT INTO memory_evidence(memory_id,revision,source_id) VALUES(?,?,?)', id, revision, sourceId);
+    if (kind === 'commitment' && actor.kind !== 'admin') {
+      const botSubject = get('SELECT id FROM subject WHERE scope_id=? AND qq_id=?', scope.id, scope.owner_bot_id);
+      const hasSentSource = sources.some(sourceId => {
+        const source = sourceFor(actor, scope.id, sourceId);
+        return source.kind === 'platform_message' && get("SELECT 1 FROM message_event WHERE id=? AND direction='outbound' AND sent_successfully=1", source.target_id);
+      });
+      // 模型没有明确承诺主体时保留候选待核实，不能把群友的话自动算成机器人的承诺。
+      if (!subjects.length || (subjects.includes(botSubject?.id) && !hasSentSource)) {
+        run("UPDATE memory_item SET status='needs_review' WHERE id=?", id);
+        issue(scope.id, 'commitment_attribution', { memoryIds: [id] });
+      }
+    }
     run("DELETE FROM memory_relation WHERE from_id=? AND type='link'", id);
     for (const match of body.matchAll(/\[\[([a-zA-Z0-9-]{1,80})(?:\|[^\]]*)?\]\]/g)) {
       if (match[1] !== id && get('SELECT id FROM memory_item WHERE id=? AND scope_id=?', match[1], scope.id))
@@ -159,7 +171,14 @@ export function createMemoryService({ store, config = {}, clock = Date.now }) {
       scopeFor(actor, input.scopeId, { write: true, generation: input.scopeGeneration });
       return idempotent(input.scopeId, 'create', input, () => writeItem(actor, input));
     },
+    async authorizeAgent(actor, { scopeId }) {
+      const scope = scopeFor(actor, scopeId, { write: true });
+      const overrides = parseJson(scope.policy, {});
+      if (!policy.enabled || overrides.enabled === false || (overrides.mode || policy.mode) !== 'active') throw new MemoryError('MEMORY_DISABLED', '当前会话尚未启用长期记忆对话能力', 403);
+      return { enabled: true, mode: 'active', generation: scope.generation };
+    },
     async proposeItem(actor, input) {
+      if (actor.kind === 'agent') await api.authorizeAgent(actor, { scopeId: input.scopeId });
       scopeFor(actor, input.scopeId, { write: true, generation: input.scopeGeneration });
       return idempotent(input.scopeId, 'propose', input, () => {
         const result = writeItem(actor, input);
@@ -289,17 +308,30 @@ export function createMemoryService({ store, config = {}, clock = Date.now }) {
           accepted++;
         }
         if (snapshot.advancesCursor !== false) run('INSERT INTO memory_cursor(scope_id,last_source_order,last_run_at,source_offset) VALUES(?,?,?,?) ON CONFLICT(scope_id) DO UPDATE SET last_source_order=excluded.last_source_order,last_run_at=excluded.last_run_at,source_offset=excluded.source_offset', scope.id, snapshot.throughOrder, clock(), snapshot.sourceOffset || 0);
-        run("UPDATE memory_job SET status='succeeded',result=?,input_snapshot=NULL,updated_at=? WHERE id=?", JSON.stringify({ accepted }), clock(), jobId);
+        const previous = parseJson(job.result, {}) || {};
+        run('UPDATE memory_job SET status=?,result=?,input_snapshot=NULL,updated_at=? WHERE id=?', snapshot.complete === false ? 'queued' : 'succeeded',
+          JSON.stringify({ accepted: (previous.accepted || 0) + accepted, last_source_order: snapshot.throughOrder, source_offset: snapshot.sourceOffset || 0, sourceUpper: snapshot.sourceUpper }), clock(), jobId);
         return { accepted };
       });
     },
     getConfig() { return structuredClone(policy); },
-    async getPolicy(actor) {
+    async getPolicy(actor, { scopeId } = {}) {
       requireAdmin(actor);
+      if (scopeId) {
+        const scope = scopeFor(actor, scopeId), overrides = parseJson(scope.policy, {});
+        return { scopeId, revision: scope.revision, config: { ...structuredClone(policy), enabled: policy.enabled && overrides.enabled !== false, mode: overrides.mode || policy.mode }, overrides, globalEnabled: policy.enabled };
+      }
       return { config: structuredClone(policy), revision: get('SELECT revision FROM memory_settings WHERE id=1')?.revision || 0 };
     },
-    async updatePolicy(actor, { expectedRevision, config: next }) {
+    async updatePolicy(actor, { scopeId, expectedRevision, config: next }) {
       requireAdmin(actor);
+      if (scopeId) {
+        const scope = scopeFor(actor, scopeId, { write: true });
+        if (scope.revision !== expectedRevision) throw new MemoryError('REVISION_CONFLICT', '会话策略已变化', 409);
+        const resolved = resolveMemoryConfig(next);
+        run('UPDATE memory_scope SET policy=?,revision=revision+1 WHERE id=?', JSON.stringify({ enabled: resolved.enabled, mode: resolved.mode }), scopeId);
+        return api.getPolicy(actor, { scopeId });
+      }
       const old = get('SELECT revision FROM memory_settings WHERE id=1')?.revision || 0;
       if (expectedRevision !== old) throw new MemoryError('REVISION_CONFLICT', '策略已变化，请刷新', 409);
       const merged = { ...policy, ...next };
@@ -312,6 +344,7 @@ export function createMemoryService({ store, config = {}, clock = Date.now }) {
       return { config: structuredClone(policy), revision: old + 1 };
     },
     async getEvidence(actor, { scopeId, sourceIds }) {
+      if (actor.kind === 'agent') await api.authorizeAgent(actor, { scopeId });
       scopeFor(actor, scopeId);
       if (!Array.isArray(sourceIds) || sourceIds.length > 20) throw new MemoryError('INVALID_INPUT', '一次最多查询20个来源');
       return sourceIds.map(id => {
@@ -473,6 +506,8 @@ export function createMemoryService({ store, config = {}, clock = Date.now }) {
           }
           run('DELETE FROM source_record WHERE id=?', id);
         }
+        // 清理整个索引后，为未清除条目补建当前代次任务，否则剩余记忆会永久失去召回。
+        run("INSERT INTO memory_outbox(scope_id,generation,kind,target_id,revision) SELECT scope_id,?,'index',id,current_revision FROM memory_item WHERE scope_id=?", generation, plan.scopeId);
         // 不删除人物的稳定 QQ 标识，但清除可能来自已删除原文的别名。
         run('DELETE FROM subject_alias WHERE subject_id IN (SELECT id FROM subject WHERE scope_id=?)', plan.scopeId);
         run('UPDATE subject SET name=qq_id WHERE scope_id=?', plan.scopeId);

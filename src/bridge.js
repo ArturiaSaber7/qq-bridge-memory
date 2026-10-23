@@ -1397,6 +1397,7 @@ async function main() {
   let memoryRuntimePromise;
   const memoryAdmin = { kind: 'admin' };
   const memoryScopes = new Map();
+  const memoryImportedScopes = new Set();
   const memoryBlockedKeys = new Set();
   function memoryRuntime() {
     if (!memoryRuntimePromise) memoryRuntimePromise = createMemoryRuntime({
@@ -1412,12 +1413,22 @@ async function main() {
     const policy = await runtime.getConfig();
     if (!policy.enabled || !String(plainContent || '').trim()) return;
     const scope = await runtime.ensureScope(memoryAdmin, { ownerBotId: String(event.self_id), conversationKey: key });
+    if (!(await runtime.getPolicy(memoryAdmin, { scopeId: scope.id })).config.enabled) return;
+    const previousScope = memoryScopes.get(key);
+    if (previousScope && previousScope.owner_bot_id !== scope.owner_bot_id) {
+      // 换机器人账号时不复用旧账号的模型上下文或旧印象，长期库仍分别保留。
+      retireSession(key); socialV2.conversations.delete(key); saveSocialV2State();
+    }
     memoryScopes.set(key, { ...scope, queryHint: plainContent.slice(-2000) });
     if (scope.barrier) { memoryBlockedKeys.add(key); return; }
     await runtime.captureMessage(memoryAdmin, { scopeId: scope.id, generation: scope.generation,
       platformMessageId: event.message_id ?? event.msg_id, senderId: String(event.user_id),
       senderName: event.sender?.card || event.sender?.nickname, text: plainContent,
       segments: event.message, occurredAt: Number.isFinite(event.time) ? event.time * 1000 : undefined });
+    if (!memoryImportedScopes.has(scope.id)) {
+      await runtime.importLegacy(memoryAdmin, { scopeId: scope.id, snapshot: { userImpressions: getSocialV2State(key).memberImpressions || {} } });
+      memoryImportedScopes.add(scope.id);
+    }
   }
   async function finishMemoryErase(runtime, operation) {
     const overview = await runtime.readResource(memoryAdmin, { resource: 'overview' });
@@ -1442,7 +1453,7 @@ async function main() {
     if (!scope || !memoryRuntimePromise || memoryBlockedKeys.has(key)) return;
     try {
       const runtime = await memoryRuntime();
-      if (!(await runtime.getConfig()).enabled) return;
+      if (!(await runtime.getPolicy(memoryAdmin, { scopeId: scope.id })).config.enabled) return;
       await runtime.captureMessage(memoryAdmin, { scopeId: scope.id, generation: scope.generation,
         senderId: scope.owner_bot_id, senderName: '我', text: content, platformMessageId,
         direction: 'outbound', sentSuccessfully: true, occurredAt: Date.now() });
@@ -6370,6 +6381,7 @@ async function main() {
           if (!scope) { sendJson({ ok: false, error: '当前会话尚未建立长期记忆范围' }, 404); return; }
           const runtime = await memoryRuntime();
           const actor = { kind: 'agent', scopeId: scope.id };
+          await runtime.authorizeAgent(actor, { scopeId: scope.id });
           const action = url.pathname.split('/').at(-1);
           let data;
           if (action === 'recall') data = await runtime.buildPacket({ scopeId: scope.id, generation: scope.generation, query: String(body.query || ''), mode: body.mode === 'deep' ? 'deep' : 'normal', visibilityMode: 'fresh' });
@@ -9284,7 +9296,7 @@ async function main() {
     if (memoryScope && memoryRuntimePromise) {
       try {
         const runtime = await memoryRuntime();
-        const policy = await runtime.getConfig();
+        const policy = (await runtime.getPolicy(memoryAdmin, { scopeId: memoryScope.id })).config;
         if (policy.enabled && policy.mode === 'active') {
           memoryBinding = await runtime.bindSession({ scopeId: memoryScope.id, sessionId });
           // 原生压缩无法提供可靠保留回执时，按 fresh 召回，避免错误永久去重。

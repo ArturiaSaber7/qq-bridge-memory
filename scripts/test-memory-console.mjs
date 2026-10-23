@@ -20,12 +20,24 @@ try {
   assert.equal(await page.locator('.memory-preview img').count(),0);
   await page.getByRole('button',{name:'历史与恢复',exact:true}).click();
   await page.getByRole('heading',{name:/v1 ·/}).waitFor();
+  await page.getByRole('button',{name:'对比当前版本',exact:true}).click();
+  await page.getByText(/按行对比 v1 → v2/).waitFor();
   await page.getByRole('button',{name:'恢复为新版本',exact:true}).click();
   await page.locator('#memoryDetail .memory-meta').filter({hasText:'v3'}).waitFor();
   await page.getByRole('button',{name:'来源证据',exact:true}).click();
   await page.locator('#memoryDetail pre').filter({hasText:'knowledge_revision'}).first().waitFor();
+  await page.selectOption('#memoryView','policy');
+  await page.getByLabel('长期记忆',{exact:true}).selectOption('true');
+  await page.getByRole('button',{name:'保存策略',exact:true}).click();
+  await page.waitForFunction(()=>!memoryUI.busy);
+  await page.getByLabel('策略作用范围').selectOption('scope');
+  await page.waitForFunction(()=>!memoryUI.busy);
+  await page.getByLabel('使用模式',{exact:true}).selectOption('active');
+  await page.getByRole('button',{name:'保存策略',exact:true}).click();
+  await page.waitForFunction(()=>!memoryUI.busy);
+  await page.waitForFunction(()=>document.querySelector('#memoryDetail select[aria-label="策略作用范围"]')?.value==='scope'&&!document.getElementById('memoryError').textContent);
   await page.setViewportSize({width:390,height:844});
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1));
   assert.deepEqual(errors,[]);
-  console.log('memory console: PASS (edit/history/restore/evidence/XSS/mobile)');
+  console.log('memory console: PASS (edit/diff/restore/evidence/scope policy/XSS/mobile)');
 } finally { await browser?.close();await fixture.close(); }

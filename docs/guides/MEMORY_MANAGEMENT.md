@@ -5,9 +5,9 @@
 ## 启用
 
 1. 使用支持 `node:sqlite` 的 Node 22.13+；本次验证使用 Node 22.23.4。
-2. 安装依赖，按照项目已有的 DSH 安装流程更新预设；`npm run build:presets` 如果本地没有该脚本，可直接运行 `node scripts/build-agent-preset-patches.mjs`。生成器包含新增 `qq-memory` 预设，需要重启 DSH 使预设生效。
+2. 安装依赖，按照项目已有的 DSH 安装流程更新预设，运行 `node scripts/build-agent-preset-patches.mjs` 生成补丁。生成器包含新增 `qq-memory` 预设，需要重启 DSH 使预设生效。
 3. 打开现有控制台的“记忆管理 → 策略”，启用“仅整理观察”。二代仿真收到经过准入的消息后建立账号与会话范围，采集完整文本。
-4. 检查整理结果、来源和待处理项，再切换“整理并注入聊天”。不需要另建管理网站。
+4. 检查整理结果、来源和待处理项，在策略中选择“当前会话”，仅对目标群/私聊切换“整理并注入聊天”。全局关闭会覆盖所有会话；观察模式也禁止聊天模型通过长期记忆工具绕过开关。不需要另建管理网站。
 
 在控制台保存的策略保存在 SQLite，重启继续生效；初始配置可写入 `config.json` 的 `memory` 节点。数据库位置只能通过启动配置修改。
 
@@ -40,3 +40,5 @@
 - Obsidian 风格的库、链接与管理界面已在控制台中提供。真实 Obsidian vault 双向同步仍是可选后续模块，本次不自动读写个人库。
 - `npm run test:memory` 使用临时数据库和离线 QQ/DSH fixture。浏览器测试沿用现有项目方式，通过 `PLAYWRIGHT_MODULE` 和 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` 指定 Playwright 与 Chromium；不会发送真实 QQ 消息。
 - 上线前需要在目标 DSH 实例确认 `qq-memory` 预设已注册且输出限制生效；离线测试不等于真实账号验证。
+
+本次离线验证：记忆测试15/15、原 token 协议与账本测试通过。原审计33/35，既有失败为缺失的 `VOICE.md` 和 DSH 工具名单检查；原控制台21/23，旧提交同样出现请求基线不匹配与走势图异步断言失败。这些历史失败未通过放宽断言来掩盖。

@@ -1,5 +1,5 @@
 // 由控制台宿主嵌入同一脚本，复用现有认证、主题和导航；记忆正文永不作为 HTML 执行。
-const memoryUI = { scopeId: '', item: null, items: [], view: 'library', busy: false, cursor: null };
+const memoryUI = { scopeId: '', item: null, items: [], view: 'library', busy: false, cursor: null, policyTarget: 'global' };
 const memoryKindLabels = { reported_fact: '事实', episode: '经历', impression: '印象', commitment: '约定', knowledge: '知识' };
 const memoryStatusLabels = { active: '生效', inactive: '停用', merged: '已合并', needs_review: '待核实', disputed: '有争议' };
 const memoryNav = document.createElement('button');
@@ -67,9 +67,13 @@ async function memoryLoadView() {
   const view = memEl('memoryView').value, list = memEl('memoryList'), pane = memEl('memoryDetail');
   memoryUI.view = view; list.replaceChildren(); pane.replaceChildren();
   if (view === 'policy') {
-    const policy = await memoryRequest('policy');
+    const scopePolicy = memoryUI.policyTarget === 'scope' && memoryUI.scopeId;
+    const policy = await memoryRequest('policy'+(scopePolicy?'?scopeId='+encodeURIComponent(memoryUI.scopeId):''));
     memoryText('h3','记忆策略',pane);
     memoryText('p','先使用 shadow 观察整理结果，再切换 active 注入聊天。修改额度不会增加模型能力。',pane);
+    const target=document.createElement('select');target.setAttribute('aria-label','策略作用范围');target.innerHTML='<option value="global">全局默认</option><option value="scope">当前会话</option>';target.value=scopePolicy?'scope':'global';pane.append(target);
+    target.onchange=()=>memoryAction(async()=>{memoryUI.policyTarget=target.value;await memoryLoadView();});
+    if(scopePolicy)memoryText('p','当前会话只覆盖启用状态和模式。全局开关关闭时，所有会话均停止使用长期记忆。',pane);
     const controls=[];
     for(const [path,label,type,options] of [
       ['enabled','长期记忆','select',[['false','关闭'],['true','启用']]],
@@ -78,12 +82,13 @@ async function memoryLoadView() {
       ['recall.deepMaxTokens','深入查询预算','number'],['consolidation.maxRequestsPerAccountDay','每日普通整理次数','number'],
       ['reflection.maxRequestsPerAccountDay','每日反思次数','number'],['consolidation.triggerMessages','批量整理消息数','number']
     ]) {
+      if(scopePolicy && path.includes('.'))continue;
       const keys=path.split('.'),value=keys.reduce((v,k)=>v[k],policy.config),labelEl=document.createElement('label');labelEl.textContent=label+' ';
-      const control=document.createElement(type==='select'?'select':'input');if(type!=='select'){control.type='number';control.min='1';}
+      const control=document.createElement(type==='select'?'select':'input');control.setAttribute('aria-label',label);if(type!=='select'){control.type='number';control.min='1';}
       for(const [v,l]of options||[]){const option=document.createElement('option');option.value=v;option.textContent=l;control.append(option);}
       control.value=String(value);labelEl.append(control);const row=document.createElement('div');row.className='memory-toolbar';row.append(labelEl);pane.append(row);controls.push({keys,control,type});
     }
-    pane.append(memoryButton('保存策略', async()=>{const config=structuredClone(policy.config);for(const {keys,control,type}of controls){const target=keys.length===1?config:config[keys[0]];target[keys.at(-1)]=keys[0]==='enabled'?control.value==='true':type==='number'?Number(control.value):control.value;}await memoryRequest('policy','POST',{expectedRevision:policy.revision,config});await memoryLoadView();})); return;
+    pane.append(memoryButton('保存策略', async()=>{const config=structuredClone(policy.config);for(const {keys,control,type}of controls){const target=keys.length===1?config:config[keys[0]];target[keys.at(-1)]=keys[0]==='enabled'?control.value==='true':type==='number'?Number(control.value):control.value;}await memoryRequest('policy','POST',{scopeId:scopePolicy?memoryUI.scopeId:undefined,expectedRevision:policy.revision,config});await memoryLoadView();})); return;
   }
   if (!memoryUI.scopeId) { memoryText('p','暂无会话。启用策略后，二代仿真收到消息时会建立记忆范围。',pane);return; }
   const scope = 'scopeId='+encodeURIComponent(memoryUI.scopeId);
@@ -125,7 +130,7 @@ async function memoryLoadView() {
   const rows=await memoryRequest(view+'?'+scope);
   if(view==='jobs') for(const type of ['consolidation','reflection','rebuild']) list.append(memoryButton({consolidation:'整理新来源',reflection:'反思',rebuild:'重建'}[type],async()=>{await memoryRequest('jobs','POST',{scopeId:memoryUI.scopeId,type});await memoryLoadView();}));
   for(const row of rows) {
-    const button=memoryButton(row.name||`${row.type} · ${row.status}`,async()=>{
+    const button=memoryButton(row.name||(view==='messages'?`${row.sender_name} · ${String(row.text).slice(0,50)}`:`${row.type} · ${row.status}`),async()=>{
       pane.replaceChildren();
       if(view==='views'){const saved=row.data||{};memEl('memoryQuery').value=saved.query||'';memEl('memoryKind').value=saved.kind||'';memEl('memoryStatus').value=saved.status||'';memEl('memoryView').value='library';await memoryLoadView();return;}
       if(view==='subjects'){const person=await memoryRequest('subjects/'+row.id+'?'+scope);memoryText('h3',person.name+' · '+person.qq_id,pane);for(const item of person.memories.items)pane.append(memoryButton(item.title,()=>memoryOpenItem(item.id)));return;}
@@ -161,7 +166,20 @@ async function memoryOpenItem(id) {
   pane.append(memoryButton('来源证据',async()=>{const rows=await memoryRequest(`items/${item.id}/evidence`);details.replaceChildren();for(const source of rows)memoryText('pre',JSON.stringify(source,null,2),details);}));
   pane.append(memoryButton('历史与恢复',async()=>{
     const revisions=await memoryRequest(`items/${item.id}/revisions`);details.replaceChildren();
-    for(const rev of revisions){memoryText('h4',`v${rev.revision} · ${new Date(rev.recordedAt).toLocaleString()}`,details);memoryText('pre',rev.body,details);if(rev.revision!==item.revision)details.append(memoryButton('恢复为新版本',async()=>{await memoryRequest(`items/${item.id}/revise`,'POST',{...rev,memoryId:undefined,scopeId:item.scopeId,expectedRevision:item.revision,sourceIds:rev.evidence.map(e=>e.id),reason:`恢复 v${rev.revision}`,idempotencyKey:crypto.randomUUID()});await memoryOpenItem(item.id);}));}
+    for(const rev of revisions){
+      memoryText('h4',`v${rev.revision} · ${new Date(rev.recordedAt).toLocaleString()}`,details);memoryText('pre',rev.body,details);
+      if(rev.revision!==item.revision){
+        details.append(memoryButton('对比当前版本',async()=>{
+          const previous=rev.body.split('\n'),current=item.body.split('\n'),diff=document.createElement('pre');
+          memoryText('p',`按行对比 v${rev.revision} → v${item.revision}，− 为旧行，+ 为当前行；最多显示1000行。`,details);
+          for(let i=0;i<Math.min(1000,Math.max(previous.length,current.length));i++){
+            if(previous[i]===current[i])memoryText('div','  '+(current[i]||''),diff);
+            else {if(previous[i]!==undefined)memoryText('div','− '+previous[i],diff).style.color='#b64635';if(current[i]!==undefined)memoryText('div','+ '+current[i],diff).style.color='#287650';}
+          }details.append(diff);
+        }));
+        details.append(memoryButton('恢复为新版本',async()=>{await memoryRequest(`items/${item.id}/revise`,'POST',{...rev,memoryId:undefined,scopeId:item.scopeId,expectedRevision:item.revision,sourceIds:rev.evidence.map(e=>e.id),reason:`恢复 v${rev.revision}`,idempotencyKey:crypto.randomUUID()});await memoryOpenItem(item.id);}));
+      }
+    }
   }));
   pane.append(memoryButton('关联与反向链接',async()=>{details.replaceChildren();const rows=await memoryRequest(`items/${item.id}/relations`);for(const row of rows){const target=row.from_id===item.id?row.to_id:row.from_id;details.append(memoryButton(`${row.from_id===item.id?'链接':'反向链接'} · ${target}`,()=>memoryOpenItem(target)));}if(!rows.length)memoryText('p','暂无关联；正文可使用 [[记忆ID]] 建立链接。',details);}));
   pane.append(memoryButton('合并',async()=>{

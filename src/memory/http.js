@@ -13,7 +13,7 @@ export async function handleMemoryRequest({ req, url, actor, service, readJson, 
     if (req.method === 'GET') {
       if (resource === 'items' && !id) data = await service.listItems(actor, filter);
       else if (resource === 'items' && !action) data = await service.getItem(actor, { memoryId: id, revision: filter.revision ? Number(filter.revision) : undefined });
-      else if (resource === 'policy') data = await service.getPolicy(actor);
+      else if (resource === 'policy') data = await service.getPolicy(actor, filter);
       else {
         const reads = { overview: 'overview', subjects: id ? 'subject' : 'subjects', jobs: id ? 'job' : 'jobs', issues: id ? 'issue' : 'issues', operations: id ? 'operation' : 'operations', messages: 'messages', views: 'views', graph: 'graph', 'context-status': 'context-status' };
         const selected = resource === 'items' && ['revisions', 'evidence', 'relations'].includes(action) ? action : reads[resource];
