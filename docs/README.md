@@ -22,6 +22,8 @@
 
 | 文档 | 一句话说明 | 状态 |
 | --- | --- | --- |
+| [design/2026-10-23-memory-management-design.md](design/2026-10-23-memory-management-design.md) | 长期记忆优化与控制台「记忆管理」一体化设计：研究依据、数据模型、群聊压缩、页面交互、API、token 预算与验收；外部 Obsidian 为可选扩展 | 核心功能已落地，能力边界见 [记忆管理指南](guides/MEMORY_MANAGEMENT.md)；设计文档仅本地保存，不随仓库发布 |
+| [design/2026-10-23-memory-management-implementation.md](design/2026-10-23-memory-management-implementation.md) | 具体实施规格：文件与接口、12 个开发任务、控制台完整交互、测试/迁移/回退及代码注释规范；不含已撤回的逐步 token 明细扩展 | 已有对应实现与离线测试，真实 QQ/DSH 验证仍待完成；实施设计仅本地保存，不随仓库发布 |
 | [design/GEN2_SIMULATION_PLAN.md](design/GEN2_SIMULATION_PLAN.md) | 二代仿真（`reserved2`）「一切皆工具」实施计划：WakeConfig 唤醒调度、MCP 工具集、控制台参数、`qq-chat-v2` preset | ⚠️ 骨架/API/调度/MCP/UI 均已落地，文中「状态：实施中」与残留 TODO 以当前代码为准 |
 | [design/SOCIAL_MODE_PLAN.md](design/SOCIAL_MODE_PLAN.md) | 一代仿真模式（`reserved`）的头脑风暴定案：规则引擎管「何时说」、LLM 管「说什么」 | ⚠️ 描述的一代状态机已实现；`reserved2` 已是默认模式，设计背景仍有效 |
 | [design/DSH_QQ_TOOLS_PLAN.md](design/DSH_QQ_TOOLS_PLAN.md) | 「一切皆工具」总路线与交接文档：当前能力盘点、安全性设计、分阶段计划 | ⚠️ 阶段计划大部分已完成，作为路线/安全设计参考仍有效 |
