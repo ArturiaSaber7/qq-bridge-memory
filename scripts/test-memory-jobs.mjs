@@ -1,0 +1,41 @@
+import assert from 'node:assert/strict';
+import { memoryFixture, admin } from './memory-test-fixture.mjs';
+import { createMemoryJobs } from '../src/memory/jobs.js';
+import { createMemoryBudget } from '../src/memory/budget.js';
+import { resolveMemoryConfig } from '../src/memory/config.js';
+let now = Date.parse('2026-10-23T04:00:00Z');
+const config = resolveMemoryConfig({ enabled: true });
+const f = await memoryFixture({ clock: () => now, config });
+try {
+  const scope = await f.service.ensureScope(admin, { ownerBotId: '100', conversationKey: 'group:123' });
+  const budget = createMemoryBudget({ store: f.store, getConfig: () => config, clock: () => now });
+  for (let i = 0; i < 4; i++) await budget.reserve({ accountId: '100', purpose: 'consolidation', inputTokens: 100, maxOutputTokens: 100 });
+  await assert.rejects(budget.reserve({ accountId: '100', purpose: 'consolidation', inputTokens: 100, maxOutputTokens: 100 }), { code: 'BUDGET_EXHAUSTED' });
+  await budget.reserve({ accountId: '100', purpose: 'reflection', inputTokens: 100, maxOutputTokens: 100 });
+  await assert.rejects(budget.reserve({ accountId: '100', purpose: 'reflection', inputTokens: 100, maxOutputTokens: 100 }), { code: 'BUDGET_EXHAUSTED' });
+  now += 86400000;
+  const source = await f.service.captureMessage(admin, { scopeId: scope.id, senderId: '456', text: '我喜欢钓鱼', direction: 'inbound' });
+  let generate;
+  const jobs = createMemoryJobs({ store: f.store, service: f.service, budget, getConfig: () => config, clock: () => now,
+    model: { generate: args => generate(args) } });
+  generate = async () => ({ text: JSON.stringify({ candidates: [{ kind: 'reported_fact', title: '兴趣', body: '用户说喜欢钓鱼', sourceIds: [source.sourceId] }] }), usage: { inputTokens: 100, outputTokens: 50 } });
+  const task = await jobs.enqueueJob(admin, { scopeId: scope.id, type: 'consolidation' });
+  await jobs.runNext();
+  assert.equal(f.store.get('SELECT status FROM memory_job WHERE id=?', task.jobId).status, 'succeeded');
+  assert.equal((await f.service.listItems(admin, { scopeId: scope.id })).items.length, 1);
+  assert.equal(f.store.get('SELECT last_source_order FROM memory_cursor WHERE scope_id=?', scope.id).last_source_order, 1);
+  await jobs.runNext();
+  assert.equal((await f.service.listItems(admin, { scopeId: scope.id })).items.length, 1);
+  await f.service.captureMessage(admin, { scopeId: scope.id, senderId: '456', text: '我最近改玩摄影了', direction: 'inbound' });
+  let finish;
+  generate = () => new Promise(resolve => { finish = resolve; });
+  const late = await jobs.enqueueJob(admin, { scopeId: scope.id, type: 'consolidation' });
+  const pending = jobs.runNext();
+  while (!finish) await new Promise(resolve => setImmediate(resolve));
+  f.store.run('UPDATE memory_scope SET generation=generation+1 WHERE id=?', scope.id);
+  finish({ text: JSON.stringify({ candidates: [] }), usage: null });
+  await pending;
+  assert.equal(f.store.get('SELECT status FROM memory_job WHERE id=?', late.jobId).status, 'cancelled');
+  assert.equal(f.store.get('SELECT last_source_order FROM memory_cursor WHERE scope_id=?', scope.id).last_source_order, 1);
+  console.log('PASS memory jobs: account quotas, day boundary, atomic cursor, stale results');
+} finally { await f.close(); }

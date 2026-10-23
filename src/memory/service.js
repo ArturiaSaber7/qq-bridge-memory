@@ -133,7 +133,7 @@ export function createMemoryService({ store, config = {}, clock = Date.now }) {
       if (existing) return { sourceId: existing.id, duplicate: true };
       return store.transaction(() => {
         const now = clock(), messageId = randomUUID(), sourceId = randomUUID();
-        const order = get('SELECT coalesce(max(source_order),0)+1 n FROM message_event').n;
+        const order = get("UPDATE memory_sequence SET value=value+1 WHERE name='source' RETURNING value").value;
         let subject = get('SELECT * FROM subject WHERE scope_id=? AND qq_id=?', scope.id, senderId);
         const name = String(input.senderName || senderId).slice(0, 200);
         if (!subject) {
@@ -243,6 +243,214 @@ export function createMemoryService({ store, config = {}, clock = Date.now }) {
         }
         run('UPDATE memory_issue SET status=?,revision=revision+1,reason=?,updated_at=? WHERE id=?', input.action === 'dismiss' ? 'dismissed' : 'resolved', input.reason, clock(), row.id);
         return { issueId: row.id, revision: row.revision + 1 };
+      });
+    },
+    async commitJobResult(actor, { jobId, generation, candidates, snapshot }) {
+      const job = get('SELECT * FROM memory_job WHERE id=?', jobId);
+      if (!job || actor.kind !== 'worker' || actor.scopeId !== job.scope_id) throw new MemoryError('SCOPE_DENIED', '无权提交后台结果', 403);
+      const scope = scopeFor(actor, job.scope_id, { write: true, generation });
+      if (job.status !== 'running' || job.lease_until < clock()) throw new MemoryError('STALE_GENERATION', '任务租约已失效', 409);
+      return store.transaction(() => {
+        for (const sourceId of snapshot.sourceIds) sourceFor(actor, scope.id, sourceId);
+        let accepted = 0;
+        for (const candidate of candidates) {
+          if (!Array.isArray(candidate.sourceIds) || !candidate.sourceIds.length || candidate.sourceIds.some(id => !snapshot.sourceIds.includes(id))) throw new MemoryError('SOURCE_MISSING', '候选引用了本批次以外的来源');
+          writeItem(actor, { ...candidate, scopeId: scope.id, scopeGeneration: generation }); accepted++;
+        }
+        run('INSERT INTO memory_cursor(scope_id,last_source_order,last_run_at) VALUES(?,?,?) ON CONFLICT(scope_id) DO UPDATE SET last_source_order=max(last_source_order,excluded.last_source_order),last_run_at=excluded.last_run_at', scope.id, snapshot.throughOrder, clock());
+        run("UPDATE memory_job SET status='succeeded',result=?,input_snapshot=NULL,updated_at=? WHERE id=?", JSON.stringify({ accepted }), clock(), jobId);
+        return { accepted };
+      });
+    },
+    getConfig() { return structuredClone(policy); },
+    async getPolicy(actor) {
+      requireAdmin(actor);
+      return { config: structuredClone(policy), revision: get('SELECT revision FROM memory_settings WHERE id=1')?.revision || 0 };
+    },
+    async updatePolicy(actor, { expectedRevision, config: next }) {
+      requireAdmin(actor);
+      const old = get('SELECT revision FROM memory_settings WHERE id=1')?.revision || 0;
+      if (expectedRevision !== old) throw new MemoryError('REVISION_CONFLICT', '策略已变化，请刷新', 409);
+      const resolved = resolveMemoryConfig({ ...policy, ...next });
+      // 数据库路径只能在启动配置中改变，运行中更新策略不能切换到另一个库。
+      resolved.storage = policy.storage;
+      run('INSERT INTO memory_settings VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,config=excluded.config', old + 1, JSON.stringify(resolved));
+      policy = resolved;
+      return { config: structuredClone(policy), revision: old + 1 };
+    },
+    async getEvidence(actor, { scopeId, sourceIds }) {
+      scopeFor(actor, scopeId);
+      if (!Array.isArray(sourceIds) || sourceIds.length > 20) throw new MemoryError('INVALID_INPUT', '一次最多查询20个来源');
+      return sourceIds.map(id => {
+        const source = sourceFor(actor, scopeId, id);
+        const message = source.kind === 'platform_message' ? get('SELECT * FROM message_event WHERE id=? AND scope_id=?', source.target_id, scopeId) : null;
+        return { ...source, message, missing: source.kind === 'platform_message' && !message };
+      });
+    },
+    /** 控制台查询集中校验；列表不能绕过范围检查访问任意数据库表。 */
+    async readResource(actor, { resource, scopeId, id, ...filter }) {
+      requireAdmin(actor);
+      if (resource === 'overview') {
+        return { scopes: all('SELECT * FROM memory_scope ORDER BY conversation_key'), config: structuredClone(policy),
+          counts: { items: get('SELECT count(*) n FROM memory_item').n, issues: get("SELECT count(*) n FROM memory_issue WHERE status='open'").n, jobs: get("SELECT count(*) n FROM memory_job WHERE status IN ('queued','running')").n }, capabilities: { sqlite: true, lexical: 'chinese-ngram', vector: 'unavailable', context: 'native-compaction/visibility-unknown' } };
+      }
+      if (resource === 'revisions' || resource === 'evidence' || resource === 'relations') {
+        const item = itemFor(actor, id); scopeId = item.scope_id;
+        if (resource === 'revisions') return all('SELECT revision,recorded_at,reason FROM memory_revision WHERE memory_id=? ORDER BY revision DESC', id).map(row => detail(actor, id, row.revision));
+        if (resource === 'evidence') return api.getEvidence(actor, { scopeId, sourceIds: detail(actor, id).evidence.map(e => e.id).slice(0, 20) });
+        return all('SELECT * FROM memory_relation WHERE scope_id=? AND (from_id=? OR to_id=?) AND active=1 LIMIT 100', scopeId, id, id);
+      }
+      if (['job', 'issue', 'operation'].includes(resource)) {
+        const tables = { job: 'memory_job', issue: 'memory_issue', operation: 'memory_operation' };
+        const row = get(`SELECT * FROM ${tables[resource]} WHERE id=?`, id);
+        if (!row) throw new MemoryError('NOT_FOUND', '记录不存在', 404);
+        scopeFor(actor, row.scope_id);
+        return { ...row, payload: parseJson(row.payload), plan: parseJson(row.plan), result: parseJson(row.result) };
+      }
+      scopeFor(actor, scopeId);
+      const limit = Math.min(100, Math.max(1, Number(filter.limit) || 50));
+      if (resource === 'subjects') return all('SELECT * FROM subject WHERE scope_id=? ORDER BY name LIMIT ?', scopeId, limit);
+      if (resource === 'subject') {
+        const person = get('SELECT * FROM subject WHERE scope_id=? AND id=?', scopeId, id);
+        if (!person) throw new MemoryError('NOT_FOUND', '人物不存在', 404);
+        return { ...person, aliases: all('SELECT * FROM subject_alias WHERE subject_id=?', id), memories: await api.listItems(actor, { scopeId, subjectId: id }) };
+      }
+      if (resource === 'messages') return all('SELECT m.*,s.id source_id FROM message_event m JOIN source_record s ON s.target_id=m.id WHERE m.scope_id=? AND m.source_order>? ORDER BY m.source_order LIMIT ?', scopeId, Number(filter.after) || 0, limit);
+      if (resource === 'context-status') return { sessions: all('SELECT * FROM context_checkpoint WHERE scope_id=?', scopeId), native: true, qqBackend: false, visibility: 'unknown', reason: '未确认运行实例的 QQ 摘要扩展能力，保留原生压缩并按需补回记忆' };
+      const tables = { jobs: 'memory_job', issues: 'memory_issue', views: 'console_saved_view', operations: 'memory_operation' };
+      if (tables[resource]) return all(`SELECT * FROM ${tables[resource]} WHERE scope_id=? LIMIT ?`, scopeId, limit).map(row => ({ ...row, payload: parseJson(row.payload), data: parseJson(row.data), result: parseJson(row.result) }));
+      if (resource === 'graph') {
+        const first = id ? itemFor(actor, id) : get('SELECT * FROM memory_item WHERE scope_id=? ORDER BY created_at DESC LIMIT 1', scopeId);
+        if (!first) return { nodes: [], edges: [], truncated: false };
+        if (first.scope_id !== scopeId) throw new MemoryError('SCOPE_DENIED', '节点不在此范围', 403);
+        const edges = all('SELECT * FROM memory_relation WHERE scope_id=? AND (from_id=? OR to_id=?) AND active=1 LIMIT 100', scopeId, first.id, first.id);
+        const ids = [...new Set([first.id, ...edges.flatMap(e => [e.from_id, e.to_id])])].slice(0, 100);
+        return { nodes: ids.map(key => detail(actor, key)), edges: edges.filter(e => ids.includes(e.from_id) && ids.includes(e.to_id)), truncated: edges.length === 100 };
+      }
+      throw new MemoryError('NOT_FOUND', '未知查询', 404);
+    },
+    async saveView(actor, { scopeId, id, name, data, expectedRevision }) {
+      requireAdmin(actor); scopeFor(actor, scopeId);
+      requiredText(name, 'name', 100);
+      const content = JSON.stringify(data || {});
+      if (content.length > 10000) throw new MemoryError('INVALID_INPUT', '保存视图过大');
+      const old = id ? get('SELECT * FROM console_saved_view WHERE id=? AND scope_id=?', id, scopeId) : null;
+      if (id && (!old || old.revision !== expectedRevision)) throw new MemoryError('REVISION_CONFLICT', '视图已变化', 409);
+      const viewId = id || randomUUID(), revision = (old?.revision || 0) + 1;
+      run('INSERT INTO console_saved_view VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,data=excluded.data,revision=excluded.revision', viewId, scopeId, name, content, revision);
+      return { id: viewId, revision };
+    },
+    /** 预览仅返回标识与版本；提交重新读取来源，不能相信浏览器提供的证据。 */
+    async previewMerge(actor, { scopeId, memoryIds, targetId }) {
+      requireAdmin(actor);
+      const scope = scopeFor(actor, scopeId, { write: true });
+      if (!Array.isArray(memoryIds) || memoryIds.length < 2 || memoryIds.length > 20 || new Set(memoryIds).size !== memoryIds.length || !memoryIds.includes(targetId)) throw new MemoryError('INVALID_INPUT', '请选择2至20条不同记忆和其中的目标');
+      const revisions = {};
+      for (const id of memoryIds) {
+        const item = itemFor(actor, id);
+        if (item.scope_id !== scopeId) throw new MemoryError('SCOPE_DENIED', '只能合并同一会话的记忆', 403);
+        if (item.status === 'merged') throw new MemoryError('INVALID_INPUT', '已合并的记忆不能再次作为输入');
+        revisions[id] = item.current_revision;
+      }
+      return { scopeId, generation: scope.generation, memoryIds, targetId, revisions };
+    },
+    async commitMerge(actor, input) {
+      requireAdmin(actor);
+      const plan = input.plan || {};
+      const scope = scopeFor(actor, plan.scopeId, { write: true, generation: plan.generation });
+      return idempotent(scope.id, 'merge', input, () => {
+        if (!Array.isArray(plan.memoryIds) || plan.memoryIds.length < 2 || plan.memoryIds.length > 20 || new Set(plan.memoryIds).size !== plan.memoryIds.length || !plan.memoryIds.includes(plan.targetId)) throw new MemoryError('INVALID_INPUT', '合并预览无效');
+        const items = plan.memoryIds.map(id => {
+          const item = itemFor(actor, id);
+          if (item.scope_id !== scope.id) throw new MemoryError('SCOPE_DENIED', '范围不匹配', 403);
+          checkRevision(item, plan.revisions?.[id]);
+          if (item.status === 'merged') throw new MemoryError('REVISION_CONFLICT', '记忆已合并', 409);
+          return detail(actor, id);
+        });
+        const target = itemFor(actor, plan.targetId);
+        requiredText(input.reason, 'reason', 2000);
+        const result = writeItem(actor, { scopeId: scope.id, expectedRevision: target.current_revision,
+          title: input.title, body: input.body, reason: input.reason,
+          subjectIds: [...new Set(items.flatMap(x => x.subjectIds))], topics: [...new Set(items.flatMap(x => x.topics))],
+          sourceIds: [...new Set(items.flatMap(x => x.evidence.map(e => e.id)))] }, target);
+        for (const item of items) if (item.id !== target.id) {
+          // 历史正文保留，当前状态退出召回；索引通过同一 outbox 事务失效。
+          run("UPDATE memory_item SET status='merged',merged_into=?,updated_at=? WHERE id=?", target.id, clock(), item.id);
+          invalidate(scope, item.id, item.revision);
+        }
+        return result;
+      });
+    },
+    /** 清除来源的所有引用与知识派生闭包；预览不保存任何待清除正文。 */
+    async previewErase(actor, { scopeId, memoryIds }) {
+      requireAdmin(actor);
+      const scope = scopeFor(actor, scopeId, { write: true });
+      if (!Array.isArray(memoryIds) || !memoryIds.length || memoryIds.length > 100) throw new MemoryError('INVALID_INPUT', '请选择1至100条记忆');
+      const ids = new Set(memoryIds), sources = new Set();
+      let changed = true;
+      while (changed) {
+        const previous = ids.size + sources.size;
+        for (const id of ids) {
+          const item = itemFor(actor, id);
+          if (item.scope_id !== scopeId) throw new MemoryError('SCOPE_DENIED', '范围不匹配', 403);
+          for (const row of all('SELECT source_id FROM memory_evidence WHERE memory_id=?', id)) sources.add(row.source_id);
+          for (const row of all('SELECT id FROM source_record WHERE scope_id=? AND target_id=?', scopeId, id)) sources.add(row.id);
+        }
+        for (const id of sources) for (const row of all('SELECT DISTINCT memory_id FROM memory_evidence WHERE source_id=?', id)) ids.add(row.memory_id);
+        changed = previous !== ids.size + sources.size;
+      }
+      return { scopeId, generation: scope.generation, selectedIds: [...new Set(memoryIds)].sort(), memoryIds: [...ids].sort(), sourceIds: [...sources].sort(),
+        revisions: Object.fromEntries([...ids].sort().map(id => [id, itemFor(actor, id).current_revision])),
+        resetsConversationContext: true, clearsDerivedViews: true, remoteHistory: 'unknown' };
+    },
+    async commitErase(actor, input) {
+      requireAdmin(actor);
+      const plan = input.plan || {};
+      const fresh = await api.previewErase(actor, { scopeId: plan.scopeId, memoryIds: plan.selectedIds });
+      if (JSON.stringify(fresh) !== JSON.stringify(plan)) throw new MemoryError('REVISION_CONFLICT', '清除范围或版本已变化，请重新预览', 409);
+      requiredText(input.reason, 'reason', 2000);
+      return idempotent(plan.scopeId, 'erase', input, () => {
+        const generation = plan.generation + 1, now = clock(), operationId = randomUUID();
+        run('UPDATE memory_scope SET barrier=1,generation=? WHERE id=?', generation, plan.scopeId);
+        run("UPDATE memory_job SET status='cancelled',input_snapshot=NULL,result=NULL,error=NULL,updated_at=? WHERE scope_id=?", now, plan.scopeId);
+        run('DELETE FROM memory_fts WHERE scope_id=?', plan.scopeId);
+        run('DELETE FROM memory_view WHERE scope_id=?', plan.scopeId);
+        run('DELETE FROM context_checkpoint WHERE scope_id=?', plan.scopeId);
+        // 派生的 issue、保存视图可能包含原文片段，按会话清理，避免侧表残留。
+        run('DELETE FROM memory_issue WHERE scope_id=?', plan.scopeId);
+        run('DELETE FROM console_saved_view WHERE scope_id=?', plan.scopeId);
+        run('DELETE FROM memory_outbox WHERE scope_id=?', plan.scopeId);
+        for (const id of plan.memoryIds) {
+          run('INSERT OR IGNORE INTO memory_tombstone VALUES(?,?,?,?,?)', plan.scopeId, 'memory', id, generation, now);
+          run('DELETE FROM memory_item WHERE id=?', id);
+        }
+        for (const id of plan.sourceIds) {
+          const source = sourceFor(actor, plan.scopeId, id);
+          run('DELETE FROM memory_relation WHERE source_id=?', id);
+          if (source.kind === 'platform_message') {
+            const message = get('SELECT * FROM message_event WHERE id=?', source.target_id);
+            if (message?.platform_message_id) run('INSERT OR IGNORE INTO memory_tombstone VALUES(?,?,?,?,?)', plan.scopeId, 'message', message.platform_message_id, generation, now);
+            run('DELETE FROM message_event WHERE id=?', source.target_id);
+          }
+          run('DELETE FROM source_record WHERE id=?', id);
+        }
+        // 不删除人物的稳定 QQ 标识，但清除可能来自已删除原文的别名。
+        run('DELETE FROM subject_alias WHERE subject_id IN (SELECT id FROM subject WHERE scope_id=?)', plan.scopeId);
+        run('UPDATE subject SET name=qq_id WHERE scope_id=?', plan.scopeId);
+        run('INSERT INTO memory_operation(id,scope_id,type,status,generation,plan,created_at) VALUES(?,?,?,?,?,?,?)', operationId, plan.scopeId, 'erase', 'pending_context', generation, JSON.stringify(plan), now);
+        return { operationId, scopeId: plan.scopeId, generation, status: 'pending_context' };
+      });
+    },
+    /** 仅宿主确认旧会话已隔离后释放写屏障；远程日志无法证实清除，明确保留 unknown。 */
+    async completeErase(actor, { operationId, generation, contextRetired }) {
+      const operation = get('SELECT * FROM memory_operation WHERE id=?', operationId);
+      if (!operation || actor.kind !== 'worker' || actor.scopeId !== operation.scope_id) throw new MemoryError('SCOPE_DENIED', '无权完成清除', 403);
+      scopeFor(actor, operation.scope_id, { generation });
+      if (contextRetired !== true || operation.generation !== generation) throw new MemoryError('ERASE_BARRIER', '旧会话尚未隔离', 409);
+      return store.transaction(() => {
+        run("UPDATE memory_operation SET status='succeeded',result=? WHERE id=?", JSON.stringify({ local: 'erased', context: 'retired', remoteHistory: 'unknown' }), operationId);
+        run('UPDATE memory_scope SET barrier=0 WHERE id=?', operation.scope_id);
+        return { operationId, status: 'succeeded', remoteHistory: 'unknown' };
       });
     },
     async close() { await store.close(); }
