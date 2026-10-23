@@ -19,8 +19,11 @@ export function createMemoryIndexes({ store, vectorSearch }) {
       store.transaction(() => {
         for (const row of store.all("SELECT * FROM memory_outbox WHERE scope_id=? AND status='queued' ORDER BY id LIMIT 500", scopeId)) {
           store.run('DELETE FROM memory_fts WHERE memory_id=?', row.target_id);
-          const item = store.get('SELECT m.*,r.title,r.body FROM memory_item m JOIN memory_revision r ON r.memory_id=m.id AND r.revision=m.current_revision WHERE m.id=? AND m.scope_id=?', row.target_id, scopeId);
-          if (item?.status === 'active') store.run('INSERT INTO memory_fts(memory_id,scope_id,terms) VALUES(?,?,?)', item.id, scopeId, memoryTerms(`${item.title} ${item.body}`).join(' '));
+          const item = store.get('SELECT m.*,r.title,r.body,r.subject_ids FROM memory_item m JOIN memory_revision r ON r.memory_id=m.id AND r.revision=m.current_revision WHERE m.id=? AND m.scope_id=?', row.target_id, scopeId);
+          if (item?.status === 'active') {
+            const aliases=store.all('SELECT a.name FROM subject_alias a JOIN subject s ON s.id=a.subject_id WHERE s.scope_id=? AND s.id IN (SELECT value FROM json_each(?))',scopeId,item.subject_ids).map(row=>row.name).join(' ');
+            store.run('INSERT INTO memory_fts(memory_id,scope_id,terms) VALUES(?,?,?)', item.id, scopeId, memoryTerms(`${item.title} ${item.body} ${aliases}`).join(' '));
+          }
           store.run("UPDATE memory_outbox SET status='done' WHERE id=?", row.id);
         }
       });

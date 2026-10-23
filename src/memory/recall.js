@@ -26,6 +26,8 @@ export function createMemoryRecall({ store, indexes, getConfig = () => resolveMe
         let reason;
         if (!item || item.status !== 'active') reason = 'inactive_or_out_of_scope';
         else if (item.valid_to !== null && item.valid_to < clock()) reason = 'expired';
+        else if (item.valid_from !== null && item.valid_from > clock()) reason = 'not_yet_valid';
+        else if (request.timeRange && (item.occurred_at === null || (Number.isFinite(request.timeRange.from) && item.occurred_at < request.timeRange.from) || (Number.isFinite(request.timeRange.to) && item.occurred_at > request.timeRange.to))) reason = 'time_range';
         else if (request.subjectIds?.length && !request.subjectIds.some(s => parseJson(item.subject_ids, []).includes(s))) reason = 'subject';
         else if (request.visibilityMode !== 'fresh' && request.sessionId && store.get("SELECT 1 FROM context_receipt WHERE session_id=? AND epoch=? AND memory_id=? AND revision=? AND visibility='visible'", request.sessionId, request.contextEpoch || 1, id, item.revision)) reason = 'already_visible';
         if (reason) { excludedReasons.push({ memoryId: id, reason }); continue; }

@@ -4,7 +4,7 @@ import { MemoryError, requireAdmin } from './contracts.js';
 export async function handleMemoryRequest({ req, url, actor, service, readJson, sendJson }) {
   if (!url.pathname.startsWith('/api/memory/')) return false;
   try {
-    if (Object.hasOwn(req.headers, 'x-agent-token')) throw new MemoryError('SCOPE_DENIED', '该接口仅控制台可用', 403);
+    if (Object.hasOwn(req.headers, 'x-agent-token') || Object.hasOwn(req.headers, 'x-agent-call')) throw new MemoryError('SCOPE_DENIED', '该接口仅控制台可用', 403);
     requireAdmin(actor);
     const parts = url.pathname.slice('/api/memory/'.length).split('/').map(decodeURIComponent);
     const [resource, id, action] = parts;

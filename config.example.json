@@ -1,4 +1,5 @@
 {
+  "memory": { "enabled": false, "mode": "shadow", "storage": { "file": "state/memory.sqlite" } },
   "dsh": {
     "baseUrl": "http://127.0.0.1:3080",
     "provider": "deepseek-official",

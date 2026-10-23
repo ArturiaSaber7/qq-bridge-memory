@@ -4423,7 +4423,9 @@ document.getElementById('consoleTokenSave').addEventListener('click', () => chan
 document.getElementById('consoleTokenRandom').addEventListener('click', () => changeConsoleToken(true));
 
 // Presentation layer: keep every existing control mounted so drafts and API contracts survive navigation.
+/* MEMORY_CONSOLE_SCRIPT */
 const consolePages = {
+  memory: ['记忆管理', '让记忆有来源，也能被纠正。', '查看长期记忆、来源与历史，管理关系和整理策略。'],
   overview: ['运行总览', '让每一次连接，都自然发生。', '掌握桥接状态，轻松管理你的 QQ 智能伙伴。'],
   sessions: ['会话与审批', '让每一段对话，都有迹可循。', '查看 QQ 与 DSH 的会话映射，以及等待你回复的审批和提问。'],
   persona: ['人格与角色', '给你的伙伴，一点独特个性。', '选择已有角色，或用自己的语言写下新的性格与表达方式。'],
@@ -4445,6 +4447,8 @@ function showConsoleToast(message) {
   toastTimer = setTimeout(() => { toast.hidden = true; }, 4200);
 }
 function setConsolePage(page, { updateHash = true, focus = false, target = '' } = {}) {
+  const requestedRoute = page;
+  page = page.split('?')[0];
   if (!Object.hasOwn(consolePages, page)) page = 'overview';
   currentConsolePage = page;
   document.querySelectorAll('[data-page]').forEach(el => { el.hidden = el.dataset.page !== page; });
@@ -4458,10 +4462,11 @@ function setConsolePage(page, { updateHash = true, focus = false, target = '' } 
   document.getElementById('pageTitle').textContent = consolePages[page][1];
   document.getElementById('pageDescription').textContent = consolePages[page][2];
   document.title = consolePages[page][0] + ' · QQ 桥接控制台';
-  if (updateHash && location.hash !== '#' + page) history.pushState({}, '', '#' + page);
+  if (updateHash && location.hash !== '#' + requestedRoute) history.pushState({}, '', '#' + page);
   closeConsoleSearch();
   // 语音库按需加载：进入二代仿真页时才探测（避免每次开控制台都压网关）。
   if (page === 'social-v2' && typeof loadVoiceLibrary === 'function') loadVoiceLibrary();
+  if (page === 'memory') refreshMemoryConsole();
   if (focus) {
     document.getElementById('mainContent').focus({ preventScroll: true });
     document.getElementById(target || 'mainContent')?.scrollIntoView({ block: 'start', behavior: 'instant' });
@@ -4472,7 +4477,7 @@ document.querySelectorAll('[data-view]').forEach(button => button.addEventListen
 }));
 window.addEventListener('hashchange', () => {
   const page = location.hash.slice(1);
-  if (Object.hasOwn(consolePages, page) || !page) setConsolePage(page, { updateHash: false });
+  if (Object.hasOwn(consolePages, page.split('?')[0]) || !page) setConsolePage(page, { updateHash: false });
 });
 document.querySelector('.skip-link').addEventListener('click', event => {
   event.preventDefault();

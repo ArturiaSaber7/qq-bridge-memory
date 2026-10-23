@@ -903,6 +903,18 @@ server.tool(
   }
 );
 
+// 长期记忆独立于原有轻量记忆：模型只能读取本会话或提交带来源的待审核提案。
+for (const [name, action, description, fields] of [
+  ['qq_memory_recall', 'recall', '按内容查询当前会话的长期记忆，返回来源标识。', { query: z.string(), mode: z.enum(['normal', 'deep']).optional() }],
+  ['qq_memory_evidence', 'evidence', '查看长期记忆的原始来源，只能读取当前会话。', { sourceIds: z.array(z.string()).max(20) }],
+  ['qq_memory_propose', 'propose', '提出带来源的长期记忆候选，等待管理员确认，不覆盖现有记忆。', { title: z.string(), body: z.string(), kind: z.enum(['reported_fact','episode','impression','commitment','knowledge']), sourceIds: z.array(z.string()).min(1).max(20), idempotencyKey: z.string() }]
+]) server.tool(name, description, { key: z.string(), token: z.string(), ...fields }, async ({ token, ...input }) => {
+  try {
+    const result = await agentApi('/api/socialV2/long-memory/' + action, { method: 'POST', headers: { 'x-agent-token': token }, body: JSON.stringify(input) });
+    return { content: [{ type: 'text', text: serializeModelData(result) }] };
+  } catch (error) { return { content: [{ type: 'text', text: `长期记忆请求失败：${error.message}` }], isError: true }; }
+});
+
 server.tool(
   'qq_memory_append',
   '记录一条轻量记忆：activeTopic=进行中的话题；pendingThought=你想说但还没说的话；memberImpression=对某位群友的印象。记忆会持久化，并在后续唤醒/qq_get_prompt 中自动出现。',

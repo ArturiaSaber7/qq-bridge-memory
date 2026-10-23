@@ -2,6 +2,7 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { MemoryError, requiredText, assertScope, requireAdmin, parseJson, KINDS, STATUSES } from './contracts.js';
 import { resolveMemoryConfig } from './config.js';
+import { detectMemoryContextCapabilities } from './context.js';
 
 /** 创建服务；store 仅在宿主工作线程持有。clock 注入用于可重复的时效/额度测试。 */
 export function createMemoryService({ store, config = {}, clock = Date.now }) {
@@ -85,11 +86,17 @@ export function createMemoryService({ store, config = {}, clock = Date.now }) {
     const id = existing?.id || randomUUID(), revision = existing ? existing.current_revision + 1 : 1, now = clock();
     const commitmentStatus = kind === 'commitment' ? (input.commitmentStatus || 'pending') : null;
     if (commitmentStatus && !['pending', 'completed', 'cancelled'].includes(commitmentStatus)) throw new MemoryError('INVALID_INPUT', '约定状态无效');
-    let nature = input.sourceNature || (actor.kind === 'admin' ? 'admin_assertion' : 'reported');
-    if (!sources.length) {
+    let nature = actor.kind === 'admin' ? input.sourceNature || 'admin_assertion' : kind === 'impression' ? 'inferred' : 'reported';
+    if (kind === 'commitment' && input.commitmentOwner === 'assistant' && !sources.some(sourceId => {
+      const source = sourceFor(actor, scope.id, sourceId);
+      return source.kind === 'platform_message' && get("SELECT 1 FROM message_event WHERE id=? AND direction='outbound' AND sent_successfully=1", source.target_id);
+    })) throw new MemoryError('SOURCE_MISSING', '机器人约定必须有实际发送成功的来源');
+    const previousRevision = existing ? get('SELECT title,body FROM memory_revision WHERE memory_id=? AND revision=?', id, existing.current_revision) : null;
+    const adminCorrection = actor.kind === 'admin' && previousRevision && (previousRevision.title !== title || previousRevision.body !== body);
+    if (!sources.length || (actor.kind === 'admin' && kind === 'knowledge') || adminCorrection) {
       const sourceId = randomUUID();
       nature = kind === 'knowledge' ? 'knowledge_revision' : 'admin_assertion';
-      run('INSERT INTO source_record(id,scope_id,kind,target_id,target_revision,actor,reason,recorded_at) VALUES(?,?,?,?,?,?,?,?)', sourceId, scope.id, nature, id, revision, 'local_admin', String(input.reason || '管理员录入'), now);
+      run('INSERT INTO source_record(id,scope_id,kind,target_id,target_revision,actor,reason,recorded_at) VALUES(?,?,?,?,?,?,?,?)', sourceId, scope.id, nature, id, revision, 'local_admin', String(input.reason || (existing ? '管理员修改' : '管理员录入')), now);
       sources.push(sourceId);
     }
     if (existing) run("UPDATE memory_item SET current_revision=?,updated_at=?,status='active' WHERE id=?", revision, now, id);
@@ -151,6 +158,14 @@ export function createMemoryService({ store, config = {}, clock = Date.now }) {
     async createItem(actor, input) {
       scopeFor(actor, input.scopeId, { write: true, generation: input.scopeGeneration });
       return idempotent(input.scopeId, 'create', input, () => writeItem(actor, input));
+    },
+    async proposeItem(actor, input) {
+      scopeFor(actor, input.scopeId, { write: true, generation: input.scopeGeneration });
+      return idempotent(input.scopeId, 'propose', input, () => {
+        const result = writeItem(actor, input);
+        run("UPDATE memory_item SET status='needs_review' WHERE id=?", result.memoryId);
+        return { ...result, issueId: issue(input.scopeId, 'proposal', { memoryIds: [result.memoryId] }), status: 'needs_review' };
+      });
     },
     async reviseItem(actor, input) {
       requireAdmin(actor);
@@ -255,9 +270,25 @@ export function createMemoryService({ store, config = {}, clock = Date.now }) {
         let accepted = 0;
         for (const candidate of candidates) {
           if (!Array.isArray(candidate.sourceIds) || !candidate.sourceIds.length || candidate.sourceIds.some(id => !snapshot.sourceIds.includes(id))) throw new MemoryError('SOURCE_MISSING', '候选引用了本批次以外的来源');
-          writeItem(actor, { ...candidate, scopeId: scope.id, scopeGeneration: generation }); accepted++;
+          let existing;
+          if (candidate.action && candidate.action !== 'create') {
+            if (!['revise', 'dispute'].includes(candidate.action)) throw new MemoryError('INVALID_INPUT', '未知候选动作');
+            existing = itemFor(actor, candidate.memoryId);
+            checkRevision(existing, snapshot.memoryRevisions?.[existing.id]);
+          }
+          // 同一来源、同一正文的重建结果不重复扩增记忆。
+          if (!existing && all('SELECT m.id FROM memory_item m JOIN memory_revision r ON r.memory_id=m.id AND r.revision=m.current_revision WHERE m.scope_id=? AND m.kind=? AND r.body=? AND m.status<>?', scope.id, candidate.kind, candidate.body, 'merged').some(row => {
+            const previous = detail(actor, row.id);
+            return JSON.stringify(previous.evidence.map(e=>e.id).sort()) === JSON.stringify([...candidate.sourceIds].sort()) && JSON.stringify([...previous.subjectIds].sort()) === JSON.stringify([...(candidate.subjectIds || [])].sort());
+          })) continue;
+          const result = writeItem(actor, { ...candidate, expectedRevision: existing?.current_revision, scopeId: scope.id, scopeGeneration: generation }, existing);
+          if (candidate.action === 'dispute') {
+            run("UPDATE memory_item SET status='disputed' WHERE id=?", result.memoryId);
+            issue(scope.id, 'conflict', { memoryIds: [result.memoryId], previousRevision: result.revision - 1 });
+          }
+          accepted++;
         }
-        run('INSERT INTO memory_cursor(scope_id,last_source_order,last_run_at) VALUES(?,?,?) ON CONFLICT(scope_id) DO UPDATE SET last_source_order=max(last_source_order,excluded.last_source_order),last_run_at=excluded.last_run_at', scope.id, snapshot.throughOrder, clock());
+        if (snapshot.advancesCursor !== false) run('INSERT INTO memory_cursor(scope_id,last_source_order,last_run_at,source_offset) VALUES(?,?,?,?) ON CONFLICT(scope_id) DO UPDATE SET last_source_order=excluded.last_source_order,last_run_at=excluded.last_run_at,source_offset=excluded.source_offset', scope.id, snapshot.throughOrder, clock(), snapshot.sourceOffset || 0);
         run("UPDATE memory_job SET status='succeeded',result=?,input_snapshot=NULL,updated_at=? WHERE id=?", JSON.stringify({ accepted }), clock(), jobId);
         return { accepted };
       });
@@ -271,7 +302,9 @@ export function createMemoryService({ store, config = {}, clock = Date.now }) {
       requireAdmin(actor);
       const old = get('SELECT revision FROM memory_settings WHERE id=1')?.revision || 0;
       if (expectedRevision !== old) throw new MemoryError('REVISION_CONFLICT', '策略已变化，请刷新', 409);
-      const resolved = resolveMemoryConfig({ ...policy, ...next });
+      const merged = { ...policy, ...next };
+      for (const group of ['recall', 'consolidation', 'reflection', 'budget']) merged[group] = { ...policy[group], ...next?.[group] };
+      const resolved = resolveMemoryConfig(merged);
       // 数据库路径只能在启动配置中改变，运行中更新策略不能切换到另一个库。
       resolved.storage = policy.storage;
       run('INSERT INTO memory_settings VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,config=excluded.config', old + 1, JSON.stringify(resolved));
@@ -316,7 +349,7 @@ export function createMemoryService({ store, config = {}, clock = Date.now }) {
         return { ...person, aliases: all('SELECT * FROM subject_alias WHERE subject_id=?', id), memories: await api.listItems(actor, { scopeId, subjectId: id }) };
       }
       if (resource === 'messages') return all('SELECT m.*,s.id source_id FROM message_event m JOIN source_record s ON s.target_id=m.id WHERE m.scope_id=? AND m.source_order>? ORDER BY m.source_order LIMIT ?', scopeId, Number(filter.after) || 0, limit);
-      if (resource === 'context-status') return { sessions: all('SELECT * FROM context_checkpoint WHERE scope_id=?', scopeId), native: true, qqBackend: false, visibility: 'unknown', reason: '未确认运行实例的 QQ 摘要扩展能力，保留原生压缩并按需补回记忆' };
+      if (resource === 'context-status') return { sessions: all('SELECT * FROM context_checkpoint WHERE scope_id=?', scopeId), ...detectMemoryContextCapabilities() };
       const tables = { jobs: 'memory_job', issues: 'memory_issue', views: 'console_saved_view', operations: 'memory_operation' };
       if (tables[resource]) return all(`SELECT * FROM ${tables[resource]} WHERE scope_id=? LIMIT ?`, scopeId, limit).map(row => ({ ...row, payload: parseJson(row.payload), data: parseJson(row.data), result: parseJson(row.result) }));
       if (resource === 'graph') {
@@ -406,6 +439,11 @@ export function createMemoryService({ store, config = {}, clock = Date.now }) {
     async commitErase(actor, input) {
       requireAdmin(actor);
       const plan = input.plan || {};
+      scopeFor(actor, plan.scopeId);
+      if (get("SELECT 1 FROM memory_idempotency WHERE scope_id=? AND operation='erase' AND key=?", plan.scopeId, input.idempotencyKey)) {
+        const prior = idempotent(plan.scopeId, 'erase', input, () => null);
+        return { ...prior, status: get('SELECT status FROM memory_operation WHERE id=?', prior.operationId)?.status || prior.status };
+      }
       const fresh = await api.previewErase(actor, { scopeId: plan.scopeId, memoryIds: plan.selectedIds });
       if (JSON.stringify(fresh) !== JSON.stringify(plan)) throw new MemoryError('REVISION_CONFLICT', '清除范围或版本已变化，请重新预览', 409);
       requiredText(input.reason, 'reason', 2000);
@@ -420,6 +458,7 @@ export function createMemoryService({ store, config = {}, clock = Date.now }) {
         run('DELETE FROM memory_issue WHERE scope_id=?', plan.scopeId);
         run('DELETE FROM console_saved_view WHERE scope_id=?', plan.scopeId);
         run('DELETE FROM memory_outbox WHERE scope_id=?', plan.scopeId);
+        run('UPDATE memory_cursor SET source_offset=0 WHERE scope_id=?', plan.scopeId);
         for (const id of plan.memoryIds) {
           run('INSERT OR IGNORE INTO memory_tombstone VALUES(?,?,?,?,?)', plan.scopeId, 'memory', id, generation, now);
           run('DELETE FROM memory_item WHERE id=?', id);

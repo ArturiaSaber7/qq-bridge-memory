@@ -1,0 +1,31 @@
+// 浏览器连接临时 SQLite fixture；所有操作均不能触达真实 QQ 或生产数据库。
+import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { startConsoleFixture } from './console-ui-fixture.mjs';
+const require = createRequire(import.meta.url);
+const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const fixture = await startConsoleFixture({ memory: true });
+let browser;
+try {
+  browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
+  const page = await browser.newPage({ viewport: { width: 1360, height: 900 } });
+  const errors=[];page.on('pageerror',error=>errors.push(error.message));
+  await page.route('**/*',route=>new URL(route.request().url()).origin===fixture.url?route.continue():route.abort());
+  await page.goto(fixture.url+'/#memory');
+  await page.locator('#memoryList button').filter({hasText:'离线记忆示例'}).click();
+  await page.getByLabel('记忆正文 Markdown').fill('更新后的咖啡偏好\n<img src=x onerror=alert(1)>');
+  await page.getByLabel('修改理由').fill('核对原文');
+  await page.getByRole('button',{name:'保存新版本',exact:true}).click();
+  await page.locator('#memoryDetail .memory-meta').filter({hasText:'v2'}).waitFor();
+  assert.equal(await page.locator('.memory-preview img').count(),0);
+  await page.getByRole('button',{name:'历史与恢复',exact:true}).click();
+  await page.getByRole('heading',{name:/v1 ·/}).waitFor();
+  await page.getByRole('button',{name:'恢复为新版本',exact:true}).click();
+  await page.locator('#memoryDetail .memory-meta').filter({hasText:'v3'}).waitFor();
+  await page.getByRole('button',{name:'来源证据',exact:true}).click();
+  await page.locator('#memoryDetail pre').filter({hasText:'knowledge_revision'}).first().waitFor();
+  await page.setViewportSize({width:390,height:844});
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1));
+  assert.deepEqual(errors,[]);
+  console.log('memory console: PASS (edit/history/restore/evidence/XSS/mobile)');
+} finally { await browser?.close();await fixture.close(); }

@@ -1,6 +1,9 @@
 // Execute the real bridge initialization/functions against temporary files and fake peers.
 // No production config, QQ connection, DSH process, or persistent home is accessed.
 import fs from 'node:fs';
+import { createMemoryRuntime } from '../src/memory/runtime.js';
+import { handleMemoryRequest } from '../src/memory/http.js';
+import { createMemoryModelAdapter } from '../src/memory/model-adapter.js';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
@@ -143,6 +146,8 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   source = source.slice(0, source.indexOf("process.on('SIGINT'"));
   source = source.replace('  bot.onPrivateMessage(async (event) => {', `
   return {
+    memoryRuntime, captureLongMemory, finishMemoryErase, memoryScopes, memoryBlockedKeys, captureSendGuard,
+    async closeMemory() { if (memoryRuntimePromise) await (await memoryRuntimePromise).close(); },
     ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
@@ -186,6 +191,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     NodeApiClient: class { constructor() { return api; } },
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
+    createMemoryRuntime, handleMemoryRequest, createMemoryModelAdapter,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt,
     // 桥接的出图出口会调归一化（体积/动图抽帧）：VM 里必须能拿到这几个函数。
@@ -224,6 +230,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   bridge.setPresets(['standard', 'qq-chat', 'qq-chat-v2']);
   bridge.setReady(true);
   return { ...bridge, calls, temp, async close() {
+    await bridge.closeMemory();
     for (const timer of timers) clearTimeout(timer);
     fs.rmSync(temp, { recursive: true, force: true });
   } };

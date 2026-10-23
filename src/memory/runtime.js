@@ -36,10 +36,11 @@ export async function createMemoryRuntime({ file, config = {}, model, onWarning 
   await ready;
   const call = (method, ...args) => {
     if (closed) return Promise.reject(new MemoryError('WORKER_STOPPED', '记忆服务已关闭', 503));
+    if (waiting.size >= 256) return Promise.reject(new MemoryError('MEMORY_BUSY', '记忆请求队列已满，请稍后重试', 503));
     const id = ++sequence;
     return new Promise((resolve, reject) => { waiting.set(id, { resolve, reject }); worker.postMessage({ id, method, args }); });
   };
-  const methods = ['ensureScope', 'captureMessage', 'createItem', 'reviseItem', 'getItem', 'listItems', 'setStatus', 'importLegacy', 'resolveIssue', 'getPolicy', 'updatePolicy', 'getEvidence', 'readResource', 'saveView', 'previewMerge', 'commitMerge', 'previewErase', 'commitErase', 'completeErase', 'enqueueJob', 'changeJob', 'previewRecall', 'buildPacket', 'bindSession', 'confirmDelivery', 'markUnknown', 'getConfig', 'tick'];
+  const methods = ['ensureScope', 'captureMessage', 'createItem', 'proposeItem', 'reviseItem', 'getItem', 'listItems', 'setStatus', 'importLegacy', 'resolveIssue', 'getPolicy', 'updatePolicy', 'getEvidence', 'readResource', 'saveView', 'previewMerge', 'commitMerge', 'previewErase', 'commitErase', 'completeErase', 'enqueueJob', 'changeJob', 'previewRecall', 'buildPacket', 'bindSession', 'confirmDelivery', 'markUnknown', 'getConfig', 'tick'];
   return { ...Object.fromEntries(methods.map(method => [method, (...args) => call(method, ...args)])),
     async close() { if (closed) return; await call('close'); closed = true; await worker.terminate(); } };
 }

@@ -30,7 +30,7 @@ try {
   await store.close();
   store = await openMemoryStore({ file });
   assert.equal(store.get('SELECT count(*) n FROM memory_scope').n, 1);
-  assert.equal(store.get('SELECT count(*) n FROM schema_migration').n, 2);
+  assert.equal(store.get('SELECT count(*) n FROM schema_migration').n, 3);
   assert.equal(store.capabilities.fts5, true);
   console.log('PASS memory store: identity, constraints, rollback, lock, backup, migration, config');
 } finally {

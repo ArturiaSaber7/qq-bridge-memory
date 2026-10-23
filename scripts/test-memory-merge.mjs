@@ -10,7 +10,9 @@ try {
   const result = await f.service.commitMerge(admin, { plan, title: '合并偏好', body: '甲和乙', reason: '管理员核对', idempotencyKey: 'merge' });
   const merged = await f.service.getItem(admin, { memoryId: a.memoryId });
   assert.equal(merged.revision, 2);
-  assert.equal(merged.evidence.length, 2);
+  assert.ok(merged.evidence.some(e=>e.target_id===a.memoryId&&e.target_revision===1));
+  assert.ok(merged.evidence.some(e=>e.target_id===b.memoryId&&e.target_revision===1));
+  assert.ok(merged.evidence.some(e=>e.target_id===a.memoryId&&e.target_revision===2));
   assert.equal((await f.service.getItem(admin, { memoryId: b.memoryId })).status, 'merged');
   assert.deepEqual(await f.service.commitMerge(admin, { plan, title: '合并偏好', body: '甲和乙', reason: '管理员核对', idempotencyKey: 'merge' }), result);
   await assert.rejects(f.service.commitMerge(admin, { plan, title: '旧预览', body: '旧预览', reason: '旧预览', idempotencyKey: 'stale' }), { code: 'REVISION_CONFLICT' });

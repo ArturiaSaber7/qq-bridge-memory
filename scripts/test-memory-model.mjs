@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import { apply } from '../plugins/qq-agent-presets/qq-memory-budget.mjs';
+import { createMemoryModelAdapter } from '../src/memory/model-adapter.js';
+let listener, restriction, guard, calls=0;
+apply({ tools: { restrict: x=>restriction=x, guard: x=>guard=x }, on: (name,fn)=>{assert.equal(name,'agent/created');listener=fn;} });
+assert.deepEqual(restriction,{allow:[]});assert.equal(typeof guard({name:'mcp__snowluma__qq_send_message'}),'string');
+const agent={options:{},cancel(){throw new Error('不应取消');}};listener({agent});assert.equal(agent.options.maxTokens,1000);
+const model=createMemoryModelAdapter({generate:async()=>{calls++;return {text:'{}'};},hasBoundedPreset:()=>false});
+await assert.rejects(model.generate({limits:{maxOutputTokens:1500}}),{code:'CAPABILITY_UNAVAILABLE',notSent:true});assert.equal(calls,0);
+console.log('memory model: PASS (tool denial, hard output option, unavailable fail-closed)');

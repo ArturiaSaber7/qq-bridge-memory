@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { roleCharStats, roleSectionReport } from '../src/role-card.js';
 import { pickBucketMs } from '../src/token-ledger.js';
 import { manualDirCommand } from '../src/state-acl.mjs';
+import { memoryFixture, admin } from './memory-test-fixture.mjs';
+import { handleMemoryRequest } from '../src/memory/http.js';
 
 export const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const timestamp = '2026-09-20T08:30:00.000Z';
@@ -340,9 +342,15 @@ export function makeFixtureState() {
 }
 
 /** Bind only to loopback. Mutations affect this server's disposable in-memory state. */
-export async function startConsoleFixture({ port = 0, original = false, htmlPath, logWrites = false } = {}) {
+export async function startConsoleFixture({ port = 0, original = false, htmlPath, logWrites = false, memory = false } = {}) {
   const file = htmlPath || resolve(projectRoot, original ? 'scripts/fixtures/console.before.html' : 'public/console.html');
   await readFile(file); // Fail early rather than displaying a broken preview.
+  const memoryConsoleScript = await readFile(resolve(projectRoot, 'public/memory-console.js'), 'utf8');
+  const memoryDB = memory ? await memoryFixture() : null;
+  if (memoryDB) {
+    const scope = await memoryDB.service.ensureScope(admin, { ownerBotId: '10000', conversationKey: 'group:123456789' });
+    await memoryDB.service.createItem(admin, { scopeId: scope.id, kind: 'knowledge', title: '离线记忆示例', body: '喜欢喝咖啡', idempotencyKey: 'fixture' });
+  }
   const state = makeFixtureState();
   const requests = [];
   const unknownRequests = [];
@@ -358,7 +366,7 @@ export async function startConsoleFixture({ port = 0, original = false, htmlPath
       if (method === 'GET' && ['/', '/console', '/console.html'].includes(path)) {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
           'content-security-policy': "connect-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'" });
-        res.end(await readFile(file));
+        res.end((await readFile(file, 'utf8')).replace('/* MEMORY_CONSOLE_SCRIPT */', () => memoryConsoleScript));
         return;
       }
       if (path === '/favicon.ico') { res.writeHead(204); res.end(); return; }
@@ -375,6 +383,7 @@ export async function startConsoleFixture({ port = 0, original = false, htmlPath
         if (logWrites) console.log(`[mock write] ${method} ${path} ${JSON.stringify(body)}`);
       }
       if (method === 'GET') {
+        if (memoryDB && await handleMemoryRequest({ req, url, actor: admin, service: memoryDB.service, readJson: async()=>body, sendJson:json })) return;
         switch (path) {
           case '/api/status': return json({ ok: true, dshReady: true, mode: state.mode, role: state.role, roleMode: state.roleMode, closedAgentPreset: state.closedAgentPreset, ownerQQ: state.whitelist.ownerQQ, allowGroups: state.whitelist.allow.groups, allowPrivate: state.whitelist.allow.private, activity: '[08:30:00] 演示桥接已连接\n[08:30:12] group:123456789 · 已处理一条消息\n[08:30:20] 二代社交助手正在运行\n以上均为离线模拟数据。' });
           case '/api/presets': return json({ presets: [{ id: 'qq-chat-v2', trust: 'user' }, { id: 'qq-chat', trust: 'user' }] });
@@ -597,6 +606,7 @@ export async function startConsoleFixture({ port = 0, original = false, htmlPath
           case '/api/tokens/reset': return json({ ok: true });
         }
       }
+      if (memoryDB && await handleMemoryRequest({ req, url, actor: admin, service: memoryDB.service, readJson: async()=>body, sendJson:json })) return;
       const slangMatch = path.match(/^\/api\/slang\/([^/]+)(?:\/(confirm|reject))?$/);
       if (slangMatch && ['POST', 'PATCH', 'DELETE'].includes(method)) {
         const entry = state.slang.find(x => x.id === slangMatch[1]);
@@ -612,7 +622,7 @@ export async function startConsoleFixture({ port = 0, original = false, htmlPath
     }
   });
   await new Promise((resolveListen, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolveListen); });
-  return { server, state, requests, unknownRequests, url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise(resolveClose => server.close(resolveClose)) };
+  return { server, state, requests, unknownRequests, url: `http://127.0.0.1:${server.address().port}`, close: async () => { await new Promise(resolveClose => server.close(resolveClose)); await memoryDB?.close(); } };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

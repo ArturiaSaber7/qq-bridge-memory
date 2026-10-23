@@ -32,7 +32,7 @@ const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || [
   join(process.env.PROGRAMFILES || '', 'Google/Chrome/Application/chrome.exe'),
   join(process.env['PROGRAMFILES(X86)'] || '', 'Microsoft/Edge/Application/msedge.exe'),
 ].find(x => existsSync(x));
-const fixture = await startConsoleFixture({ original });
+const fixture = await startConsoleFixture({ original, htmlPath: args.find(x=>x.startsWith('--html='))?.slice(7) });
 let browser;
 const results = [];
 const errors = [];
